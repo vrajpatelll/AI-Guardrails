@@ -1,0 +1,63 @@
+flowchart TD
+    subgraph CLIENT["Client App"]
+        U[User / App code]
+    end
+
+    subgraph PROXY["Guardrail Proxy (drop-in base_url swap)"]
+        direction TB
+        N1[Normalizer<br/>strip zero-width/homoglyphs]
+        CACHE[(Verdict Cache<br/>key = hash of normalized input + policy_version)]
+
+        subgraph PARALLEL["Run concurrently — per enabled category, not sequential"]
+            direction LR
+            T1["Tier 1: Deterministic<br/>Presidio PII + secrets regex<br/>1-10ms<br/>(skipped only if pii/secrets disabled in policy)"]
+            T2["Tier 2: Qwen3Guard<br/>harmful content + jailbreak/injection<br/>50-300ms<br/>(skipped only if those categories disabled in policy)"]
+        end
+
+        COMBINE{"Verdict Combiner<br/>waits on all enabled detectors<br/>applies policy action per category"}
+        REDACT["Construct sanitized text<br/>replace each matchedSpan per redact rule<br/>e.g. credit card -> REDACTED_CC"]
+
+        subgraph RELOAD["Policy Reload Watcher"]
+            PW["policy.yaml changed"] --> PV["bump policy_version"]
+        end
+        PV -.new version = new cache key, old entries stop matching.-> CACHE
+
+        LOG[(Async Log / Audit Store)]
+    end
+
+    subgraph LLMSIDE["LLM Provider"]
+        LLM[OpenAI / Anthropic / Gemini]
+    end
+
+    U -->|"1. Request same API shape"| N1
+    N1 --> CACHE
+    CACHE -->|cache hit for this policy_version| COMBINE
+    CACHE -->|cache miss| PARALLEL
+    T1 --> COMBINE
+    T2 --> COMBINE
+
+    COMBINE -->|any category = BLOCK| BLOCKED[Return structured block response to client]
+    COMBINE -->|any category = REDACT, none BLOCK| REDACT
+    REDACT -->|"2a. Forward SANITIZED text"| FWD["Forward to LLM"]
+    COMBINE -->|all categories = ALLOW| FWD2["2b. Forward ORIGINAL text to LLM"]
+    FWD --> LLM
+    FWD2 --> LLM
+
+    LLM -->|"3. LLM response"| ON1[Normalizer]
+    ON1 --> OCACHE[(Output verdict cache, same key scheme)]
+    OCACHE -->|miss| OPARALLEL["Tier 1 + Tier 2 on output, concurrently: PII leak check + harmful content check"]
+    OCACHE -->|hit| ODEC{Output Verdict Combiner}
+    OPARALLEL --> ODEC
+
+    ODEC -->|BLOCK| BLOCKED2[Return blocked response]
+    ODEC -->|REDACT| OREDACT[Construct sanitized response text]
+    OREDACT --> PASS["4. Return sanitized response to client"]
+    ODEC -->|ALLOW| PASS2["4. Return original response to client"]
+
+    COMBINE -.async, does not block response.-> LOG
+    ODEC -.async, does not block response.-> LOG
+
+    BLOCKED --> U
+    BLOCKED2 --> U
+    PASS --> U
+    PASS2 --> U

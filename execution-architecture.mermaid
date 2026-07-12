@@ -1,0 +1,51 @@
+flowchart LR
+    subgraph EDGE["Edge / Integration Layer"]
+        PX["HTTP Reverse Proxy<br/>sidecar or standalone<br/>framework/language agnostic"]
+        SDK["Optional SDK middleware<br/>thin wrapper for fine control"]
+    end
+
+    subgraph CORE["Guardrail Core Service"]
+        direction TB
+        NORM["Normalizer<br/>prerequisite, always runs"]
+        POLICY["Policy Engine<br/>reads YAML policy-as-code<br/>per-category on/off + thresholds + actions<br/>holds current policy_version"]
+
+        subgraph DETECT["Parallel Multi-Tier Detection"]
+            direction TB
+            NOTE["Tiers check DIFFERENT categories, not the same one at different cost.<br/>Both run for every enabled category - one is never skipped because the other was clean."]
+            C1["Tier 1: CPU, deterministic<br/>PII + secrets<br/>runs if those categories enabled"]
+            C3["Tier 2: GPU/API, Qwen3Guard<br/>harmful content + jailbreak<br/>runs if those categories enabled"]
+        end
+
+        COMBINE["Verdict Combiner<br/>waits on all enabled detectors<br/>per-category action: block / redact / allow"]
+        REDACTOR["Redaction Builder<br/>only invoked if combiner returns REDACT<br/>rewrites text using matchedSpans, never skipped silently"]
+
+        CACHEL["Verdict Cache in-memory/Redis<br/>key = hash(normalized_text) + policy_version<br/>TTL"]
+        RELOAD["Policy Reload Watcher<br/>on policy.yaml change: increment policy_version<br/>old cache keys stop matching automatically - no stale verdicts survive a policy edit"]
+        BUDGET["Latency Budget Guard<br/>timeout -> fail-open/fail-closed per config"]
+    end
+
+    subgraph OBS["Observability"]
+        ASYNC["Async structured logger<br/>non-blocking, queue-based"]
+        AUDIT[("Audit store<br/>block reasons, spans, confidence, policy_version used")]
+    end
+
+    PX --> NORM
+    SDK --> NORM
+    RELOAD -.bumps.-> POLICY
+    POLICY -.provides current policy_version for key.-> CACHEL
+    NORM --> CACHEL
+    CACHEL -->|miss| DETECT
+    CACHEL -->|hit, same policy_version| COMBINE
+    C1 --> COMBINE
+    C3 --> COMBINE
+    COMBINE -->|action = redact| REDACTOR
+    REDACTOR --> BUDGET
+    COMBINE -->|action = block or allow| BUDGET
+    BUDGET -->|within budget| RESP["Structured verdict response<br/>includes sanitized text if redacted"]
+    BUDGET -->|exceeded| FALLBACK["Configured fallback<br/>fail-open: allow / fail-closed: block"]
+    FALLBACK --> RESP
+    RESP -.push async.-> ASYNC
+    ASYNC --> AUDIT
+
+    classDef concept fill:#eef,stroke:#446,stroke-width:1px;
+    class DETECT,CACHEL,BUDGET,ASYNC,RELOAD,REDACTOR concept
