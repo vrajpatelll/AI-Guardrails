@@ -1,14 +1,13 @@
 """
-Verdict builder: constructs stub / no-op GuardrailResponse objects.
+Verdict builder: constructs GuardrailResponse objects from detector output.
 
-Day 1: every layer downstream calls build_stub_verdict() to get a
-fully schema-valid response with no real detections.  Days 2-5 will
-replace stub calls with real detector output by filling in the
-CategoryResult objects before passing to combine_verdicts().
+Day 1: build_stub_verdict() — fully schema-valid no-op (still used in tests).
+Day 2: assemble_tier1_verdict() — real CategoryResult from Tier1Results.
+       determine_action() — BLOCK > REDACT > ALLOW per policy.
 
 Key rules (from CRITICAL constraints):
 - Tier 1 (pii, secrets) and Tier 2 (harmful_content, prompt_injection)
-  are INDEPENDENT.  Both always run unless the category is disabled.
+  are INDEPENDENT. Both always run unless the category is disabled.
   There is NO cascade skip based on Tier 1 results.
 - BLOCK always beats REDACT when combining category actions.
 - When the combined action is REDACT, sanitized_text must be set.
@@ -18,11 +17,13 @@ from __future__ import annotations
 
 import time
 import uuid
+from typing import TYPE_CHECKING
 
 from guardrail.policy import PolicyConfig, PolicyAction
 from guardrail.schema import (
     Action,
     CategoryResult,
+    Detection,
     Direction,
     ExecutionState,
     FilterMatchState,
@@ -33,13 +34,15 @@ from guardrail.schema import (
     SanitizationResult,
 )
 
+if TYPE_CHECKING:
+    from guardrail.detectors.tier1 import DetectionResult, Tier1Results
+
 
 # ---------------------------------------------------------------------------
-# Tier / category metadata (used by later layers to build CategoryResult)
+# Tier / category metadata
 # ---------------------------------------------------------------------------
 
-#: Which tier owns each built-in category.  Custom categories added via
-#: policy.yaml default to tier 2 (guard model) if not recognised here.
+#: Which tier owns each built-in category.
 CATEGORY_TIER: dict[str, int] = {
     "pii": 1,
     "secrets": 1,
@@ -56,7 +59,223 @@ CATEGORY_MODEL: dict[str, str | None] = {
 
 
 # ---------------------------------------------------------------------------
-# Stub builder (Day 1 — no real detection yet)
+# Action determination
+# ---------------------------------------------------------------------------
+
+def determine_action(
+    filter_results: dict[str, CategoryResult],
+    policy: PolicyConfig,
+) -> Action:
+    """
+    Walk all CategoryResult entries and return the strongest action.
+
+    Precedence: BLOCK > REDACT > ALLOW.
+    Only considers categories that have match_state=MATCH_FOUND and
+    execution_state=EXECUTION_SUCCESS.
+    """
+    has_block = False
+    has_redact = False
+
+    for cat_name, result in filter_results.items():
+        if result.execution_state != ExecutionState.EXECUTION_SUCCESS:
+            continue
+        if result.match_state != MatchState.MATCH_FOUND:
+            continue
+
+        cat_policy = policy.categories.get(cat_name)
+        if cat_policy is None or not cat_policy.enabled:
+            continue
+
+        if cat_policy.action == PolicyAction.BLOCK:
+            has_block = True
+        elif cat_policy.action == PolicyAction.REDACT:
+            has_redact = True
+
+    if has_block:
+        return Action.BLOCK
+    if has_redact:
+        return Action.REDACT
+    return Action.ALLOW
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 verdict assembler (Day 2)
+# ---------------------------------------------------------------------------
+
+def _detection_results_to_schema(
+    detections: list["DetectionResult"],
+    threshold: float,
+    action_is_redact: bool,
+) -> list[Detection]:
+    """
+    Convert internal DetectionResult objects to schema Detection objects,
+    applying confidence threshold filtering.
+    """
+    out: list[Detection] = []
+    for d in detections:
+        if d.confidence < threshold:
+            continue
+        out.append(Detection(
+            category=d.category,
+            matched_span=(d.start, d.end),
+            rule=d.rule,
+            confidence=d.confidence,
+            redacted=action_is_redact,
+        ))
+    return out
+
+
+def assemble_tier1_verdict(
+    request_id: str,
+    direction: Direction,
+    policy: PolicyConfig,
+    tier1_results: "Tier1Results",
+    normalised_text: str,
+    latency_ms: int = 0,
+    cache_hit: bool = False,
+) -> tuple[GuardrailResponse, list["DetectionResult"]]:
+    """
+    Build a GuardrailResponse from Tier 1 detector output.
+
+    Returns:
+        (verdict, redactable_detections)
+
+        redactable_detections: all detections whose category action = REDACT
+        (used by the caller to build sanitized_text via build_redacted_text).
+
+    Tier 2 categories (harmful_content, prompt_injection) are set to
+    NOT_EVALUATED here — they are wired in on Day 4.
+    """
+    # --- Build per-category results ----------------------------------------
+
+    filter_results: dict[str, CategoryResult] = {}
+
+    # PII
+    pii_policy = policy.categories.get("pii")
+    if pii_policy and pii_policy.enabled:
+        # We'll determine redacted flag after we know the action
+        pii_threshold = pii_policy.confidence_threshold
+        pii_hits_above_threshold = [
+            d for d in tier1_results.pii if d.confidence >= pii_threshold
+        ]
+        pii_match = bool(pii_hits_above_threshold)
+        filter_results["pii"] = CategoryResult(
+            execution_state=ExecutionState.EXECUTION_SUCCESS,
+            match_state=MatchState.MATCH_FOUND if pii_match else MatchState.NO_MATCH_FOUND,
+            tier=1,
+            model=None,
+            detections=[],  # filled in after action is determined
+        )
+    elif pii_policy and not pii_policy.enabled:
+        filter_results["pii"] = CategoryResult(
+            execution_state=ExecutionState.NOT_EVALUATED,
+            match_state=MatchState.NA,
+            tier=1,
+            reason="skipped: category disabled in policy",
+        )
+
+    # Secrets
+    secrets_policy = policy.categories.get("secrets")
+    if secrets_policy and secrets_policy.enabled:
+        secrets_threshold = secrets_policy.confidence_threshold
+        secrets_hits_above_threshold = [
+            d for d in tier1_results.secrets if d.confidence >= secrets_threshold
+        ]
+        secrets_match = bool(secrets_hits_above_threshold)
+        filter_results["secrets"] = CategoryResult(
+            execution_state=ExecutionState.EXECUTION_SUCCESS,
+            match_state=MatchState.MATCH_FOUND if secrets_match else MatchState.NO_MATCH_FOUND,
+            tier=1,
+            model=None,
+            detections=[],  # filled in after action is determined
+        )
+    elif secrets_policy and not secrets_policy.enabled:
+        filter_results["secrets"] = CategoryResult(
+            execution_state=ExecutionState.NOT_EVALUATED,
+            match_state=MatchState.NA,
+            tier=1,
+            reason="skipped: category disabled in policy",
+        )
+
+    # Tier 2 categories — stub NOT_EVALUATED until Day 4
+    for cat_name in ("harmful_content", "prompt_injection"):
+        cat_policy = policy.categories.get(cat_name)
+        if cat_policy and not cat_policy.enabled:
+            filter_results[cat_name] = CategoryResult(
+                execution_state=ExecutionState.NOT_EVALUATED,
+                match_state=MatchState.NA,
+                tier=2,
+                model=CATEGORY_MODEL.get(cat_name),
+                reason="skipped: category disabled in policy",
+            )
+        else:
+            filter_results[cat_name] = CategoryResult(
+                execution_state=ExecutionState.NOT_EVALUATED,
+                match_state=MatchState.NA,
+                tier=2,
+                model=CATEGORY_MODEL.get(cat_name),
+                reason="skipped: tier 2 not yet wired (Day 4)",
+            )
+
+    # --- Determine combined action -----------------------------------------
+    action = determine_action(filter_results, policy)
+
+    # --- Now populate Detection objects with correct redacted flag ----------
+    redactable_detections: list[DetectionResult] = []
+
+    if "pii" in filter_results and filter_results["pii"].execution_state == ExecutionState.EXECUTION_SUCCESS:
+        pii_pol = policy.categories.get("pii")
+        threshold = pii_pol.confidence_threshold if pii_pol else 0.0
+        pii_action_is_redact = (pii_pol.action == PolicyAction.REDACT) if pii_pol else False
+        pii_above = [d for d in tier1_results.pii if d.confidence >= threshold]
+        filter_results["pii"].detections = _detection_results_to_schema(
+            pii_above, threshold=0.0, action_is_redact=pii_action_is_redact
+        )
+        if pii_action_is_redact and action != Action.BLOCK:
+            redactable_detections.extend(pii_above)
+
+    if "secrets" in filter_results and filter_results["secrets"].execution_state == ExecutionState.EXECUTION_SUCCESS:
+        sec_pol = policy.categories.get("secrets")
+        threshold = sec_pol.confidence_threshold if sec_pol else 0.0
+        sec_action_is_redact = (sec_pol.action == PolicyAction.REDACT) if sec_pol else False
+        sec_above = [d for d in tier1_results.secrets if d.confidence >= threshold]
+        filter_results["secrets"].detections = _detection_results_to_schema(
+            sec_above, threshold=0.0, action_is_redact=sec_action_is_redact
+        )
+        if sec_action_is_redact and action != Action.BLOCK:
+            redactable_detections.extend(sec_above)
+
+    # --- Top-level match state --------------------------------------------
+    any_match = any(
+        r.match_state == MatchState.MATCH_FOUND
+        for r in filter_results.values()
+        if r.execution_state == ExecutionState.EXECUTION_SUCCESS
+    )
+
+    return GuardrailResponse(
+        request_id=request_id,
+        direction=direction,
+        sanitization_result=SanitizationResult(
+            filter_match_state=(
+                FilterMatchState.MATCH_FOUND if any_match
+                else FilterMatchState.NO_MATCH_FOUND
+            ),
+            invocation_result=InvocationResult.SUCCESS,
+            action=action,
+            latency_ms=latency_ms,
+            sanitized_text=None,   # caller sets this after calling build_redacted_text
+            filter_results=filter_results,
+            sanitization_metadata=SanitizationMetadata(
+                cache_hit=cache_hit,
+                policy_version=policy.policy_version,
+                fallback_applied=False,
+            ),
+        ),
+    ), redactable_detections
+
+
+# ---------------------------------------------------------------------------
+# Stub builder (Day 1 — still used in tests and as fallback)
 # ---------------------------------------------------------------------------
 
 def build_stub_verdict(
@@ -69,18 +288,7 @@ def build_stub_verdict(
 ) -> GuardrailResponse:
     """
     Return a fully schema-valid no-op verdict.
-
-    Every enabled category appears in filterResults with:
-    - execution_state = EXECUTION_SUCCESS
-    - match_state = NO_MATCH_FOUND
-    - detections = []
-
-    Every disabled category appears with:
-    - execution_state = NOT_EVALUATED
-    - reason = "skipped: category disabled in policy"
-
-    The combined action is always ALLOW and sanitized_text is None
-    until real detection logic populates detections in Days 2-4.
+    Used in tests and as a fallback if Presidio is unavailable.
     """
     filter_results: dict[str, CategoryResult] = {}
 
@@ -125,7 +333,7 @@ def build_stub_verdict(
 
 
 # ---------------------------------------------------------------------------
-# Verdict combiner (shell — filled in on Day 3/5 with real logic)
+# Verdict combiner (shell — filled in on Day 5 with real logic)
 # ---------------------------------------------------------------------------
 
 def combine_verdicts(
@@ -135,14 +343,10 @@ def combine_verdicts(
     """
     Merge input + output verdicts into one final response.
 
-    Day 1: returns input_verdict unchanged (output guardrail is Day 5).
-
-    BLOCK always beats REDACT (enforced here when real detections arrive):
-    - If ANY enabled category fires BLOCK → top-level action = BLOCK
-    - If no BLOCK but ANY fires REDACT → top-level action = REDACT
-    - Otherwise → ALLOW
+    Day 1/2: returns input_verdict unchanged (output guardrail is Day 5).
+    BLOCK always beats REDACT (enforced by determine_action).
     """
-    # TODO (Day 5): merge output_verdict filter_results in
+    # TODO (Day 5): merge output_verdict filter_results
     return input_verdict
 
 

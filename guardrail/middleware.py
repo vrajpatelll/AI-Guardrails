@@ -2,31 +2,19 @@
 SDK middleware: wraps an Anthropic client and intercepts every
 messages.create() call to run the guardrail pipeline.
 
-Day 1 behaviour (pass-through):
-  - Extracts the last user message text from the messages array.
-  - Normalises it and checks the verdict cache.
-  - Calls build_stub_verdict() → a no-op ALLOW verdict.
-  - Forwards the *original* (or sanitized_text if REDACT) message to
-    the real Anthropic API and returns the result.
-  - Raises a structured GuardrailBlockedError on BLOCK.
+Day 2 pipeline (Tier 1 wired, Tier 2 still stub):
+  1. Normalise text extracted from messages array.
+  2. Check verdict cache (key = hash(norm_text + policy_version)).
+  3. Run Tier1Detector (PII + secrets — both always run).
+  4. Assemble CategoryResult objects via assemble_tier1_verdict().
+  5. Determine combined action (BLOCK > REDACT > ALLOW).
+  6. If REDACT: build sanitized_text via build_redacted_text().
+  7. Cache verdict + sanitized_text.
+  8. If BLOCK: raise GuardrailBlockedError (no LLM call).
+  9. Forward original (ALLOW) or sanitized (REDACT) text to Anthropic.
+ 10. [Day 5] Output guardrail stub.
 
-Streaming: if stream=True is passed, the wrapper raises a clear
-NotImplementedError (streaming is v2 roadmap).
-
-Usage::
-
-    import anthropic
-    from guardrail.middleware import GuardrailMiddleware
-    from guardrail.config import GuardrailConfig
-
-    cfg = GuardrailConfig.from_env()
-    client = GuardrailMiddleware(cfg)
-    response = client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": "Hello!"}],
-    )
-    # response.guardrail_verdict is the full GuardrailResponse
+Streaming: rejected with NotImplementedError (v2 roadmap).
 """
 
 from __future__ import annotations
@@ -38,10 +26,17 @@ import anthropic
 
 from guardrail.cache import VerdictCache
 from guardrail.config import GuardrailConfig
+from guardrail.detectors.tier1 import Tier1Detector
 from guardrail.normalizer import normalise
 from guardrail.policy import load_policy, PolicyConfig
+from guardrail.redactor import build_redacted_text
 from guardrail.schema import Direction, GuardrailResponse
-from guardrail.verdict import build_stub_verdict, new_request_id, combine_verdicts
+from guardrail.verdict import (
+    assemble_tier1_verdict,
+    build_stub_verdict,
+    combine_verdicts,
+    new_request_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,9 +88,7 @@ class GuardrailWrappedResponse:
 # ---------------------------------------------------------------------------
 
 class _GuardrailMessages:
-    """
-    Drop-in replacement for `client.messages` that intercepts .create().
-    """
+    """Drop-in replacement for `client.messages` that intercepts .create()."""
     def __init__(self, middleware: "GuardrailMiddleware") -> None:
         self._mw = middleware
 
@@ -121,6 +114,9 @@ class GuardrailMiddleware:
         policy: Optional pre-loaded PolicyConfig.  If omitted the policy
                 is loaded from config.policy_path at construction time.
         cache_ttl_seconds: TTL for in-memory verdict cache entries.
+        tier1: Optional pre-initialised Tier1Detector.  If omitted a new
+               instance is created (expensive — Presidio loads spaCy on
+               first instantiation, ~1-2s).
 
     Example::
 
@@ -129,10 +125,10 @@ class GuardrailMiddleware:
         resp = client.messages.create(
             model="claude-3-5-haiku-20241022",
             max_tokens=512,
-            messages=[{"role": "user", "content": "Write me a poem."}],
+            messages=[{"role": "user", "content": "My email is alice@example.com"}],
         )
-        print(resp.content[0].text)
-        print(resp.guardrail_verdict.model_dump_json(indent=2))
+        print(resp.guardrail_verdict.sanitization_result.action)     # REDACT
+        print(resp.guardrail_verdict.sanitization_result.sanitized_text)
     """
 
     def __init__(
@@ -140,40 +136,40 @@ class GuardrailMiddleware:
         config: GuardrailConfig,
         policy: PolicyConfig | None = None,
         cache_ttl_seconds: float = 300.0,
+        tier1: Tier1Detector | None = None,
     ) -> None:
         self.config = config
         self.policy: PolicyConfig = policy or load_policy(config.policy_path)
         self._cache = VerdictCache(ttl_seconds=cache_ttl_seconds)
-        self._anthropic = anthropic.Anthropic(api_key=config.llm_api_key)
+        self._anthropic = anthropic.Anthropic(
+            api_key=config.llm_api_key.get_secret_value()
+        )
+        self._tier1: Tier1Detector = tier1 or Tier1Detector()
         self.messages = _GuardrailMessages(self)
 
     # ------------------------------------------------------------------
-    # Policy reload (call this to pick up policy.yaml changes live)
+    # Policy reload
     # ------------------------------------------------------------------
 
     def reload_policy(self) -> None:
         """
         Reload policy.yaml from disk.
-
-        Bumps policy_version (via load_policy) so the cache key changes
-        and stale verdicts are never served — no explicit cache flush needed.
+        Bumps policy_version so the cache key changes and stale verdicts
+        are never served.
         """
         self.policy = load_policy(self.config.policy_path)
 
     # ------------------------------------------------------------------
-    # Internal pipeline (Day 1: stub only)
+    # Text extraction
     # ------------------------------------------------------------------
 
     def _extract_text(self, messages: list[dict[str, Any]]) -> str:
         """
         Extract evaluable text from a messages array.
 
-        Strategy: concatenate all user-role message content in order,
-        separated by a newline.  This covers multi-turn context while
-        giving detectors the full conversation surface to scan.
-
-        Content can be a plain string or a list of content blocks
-        (Anthropic's vision API shape); we extract only the text blocks.
+        Concatenates all user-role content in turn order, covering the
+        full conversation surface for detection.  Handles both plain-string
+        and content-block (vision API) shapes.
         """
         parts: list[str] = []
         for msg in messages:
@@ -188,19 +184,22 @@ class GuardrailMiddleware:
                         parts.append(block["text"])
         return "\n".join(parts)
 
+    # ------------------------------------------------------------------
+    # Main pipeline
+    # ------------------------------------------------------------------
+
     def _run(self, call_kwargs: dict[str, Any]) -> GuardrailWrappedResponse:
         """
         Full guardrail pipeline for a single messages.create() call.
 
-        Day 1 pipeline:
-          1. Extract + normalise text from messages array.
-          2. Check cache.
-          3. Build stub verdict (no real detection yet).
-          4. Cache the verdict.
-          5. If BLOCK → raise GuardrailBlockedError.
-          6. Forward to Anthropic.  Use sanitized_text if action=REDACT.
-          7. [Day 5] Run output guardrail on LLM response.
-          8. Return GuardrailWrappedResponse.
+        Day 2 pipeline:
+          1. Extract + normalise text.
+          2. Cache lookup.
+          3. Run Tier 1 (PII + secrets, always both).
+          4. Assemble verdict + determine action.
+          5. Build sanitized_text if action=REDACT.
+          6. Cache verdict.
+          7. BLOCK → raise. ALLOW/REDACT → forward to LLM.
         """
         t0 = time.monotonic()
         request_id = new_request_id()
@@ -215,52 +214,58 @@ class GuardrailMiddleware:
         cached = self._cache.get(cache_key)
         if cached is not None:
             cached.sanitization_result.sanitization_metadata.cache_hit = True
-            # Replay action from cache
             if cached.sanitization_result.action.value == "BLOCK":
                 raise GuardrailBlockedError(cached)
-            return self._forward_to_llm(call_kwargs, cached, messages, norm_text)
+            return self._forward_to_llm(call_kwargs, cached, messages)
 
-        # 3. Build stub verdict (Days 2-4 will replace this with real detectors)
+        # 3. Run Tier 1 detectors (both always run)
+        tier1_results = self._tier1.run(norm_text)
+
+        # 4. Assemble verdict
         latency_ms = int((time.monotonic() - t0) * 1000)
-        verdict = build_stub_verdict(
+        verdict, redactable = assemble_tier1_verdict(
             request_id=request_id,
             direction=Direction.INPUT,
             policy=self.policy,
-            original_text=norm_text,
+            tier1_results=tier1_results,
+            normalised_text=norm_text,
             latency_ms=latency_ms,
             cache_hit=False,
         )
 
-        # 4. Cache the verdict
+        # 5. Build sanitized_text for REDACT action
+        if verdict.sanitization_result.action.value == "REDACT" and redactable:
+            verdict.sanitization_result.sanitized_text = build_redacted_text(
+                norm_text, redactable
+            )
+
+        # 6. Cache the verdict (includes sanitized_text if set)
         self._cache.set(cache_key, verdict)
 
-        # 5. Block?
+        # 7. Block?
         if verdict.sanitization_result.action.value == "BLOCK":
             raise GuardrailBlockedError(verdict)
 
-        # 6. Forward to LLM
-        return self._forward_to_llm(call_kwargs, verdict, messages, norm_text)
+        # 8. Forward to LLM
+        return self._forward_to_llm(call_kwargs, verdict, messages)
 
     def _forward_to_llm(
         self,
         call_kwargs: dict[str, Any],
         verdict: GuardrailResponse,
         original_messages: list[dict[str, Any]],
-        norm_text: str,
     ) -> GuardrailWrappedResponse:
         """
-        Forward the (possibly sanitized) request to Anthropic and return
-        a wrapped response.
+        Forward the (possibly sanitized) request to Anthropic.
 
-        If action=REDACT, the last user message's content is replaced
-        with verdict.sanitization_result.sanitized_text before forwarding
-        so the LLM never sees raw PII.
+        If action=REDACT: replaces the last user message content with
+        verdict.sanitization_result.sanitized_text so the LLM never sees
+        the raw PII / secret.
         """
         forward_kwargs = dict(call_kwargs)
 
         sanitized_text = verdict.sanitization_result.sanitized_text
         if sanitized_text is not None:
-            # Replace the last user message content with the sanitized text
             msgs = list(original_messages)
             for i in reversed(range(len(msgs))):
                 if msgs[i].get("role") == "user":
@@ -268,7 +273,6 @@ class GuardrailMiddleware:
                     break
             forward_kwargs["messages"] = msgs
 
-        # Call the real Anthropic API
         raw_response = self._anthropic.messages.create(**forward_kwargs)
 
         # TODO (Day 5): run output guardrail on raw_response.content here
