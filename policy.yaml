@@ -1,0 +1,28 @@
+name: default-strict
+
+categories:
+  pii:
+    enabled: true
+    action: redact            # PII gets redacted, not blocked
+    confidence_threshold: 0.8
+
+  secrets:
+    enabled: true
+    action: block             # API keys / credentials always block
+    confidence_threshold: 0.7
+
+  harmful_content:
+    enabled: true
+    action: block
+    confidence_threshold: 0.7
+
+  prompt_injection:
+    enabled: true
+    action: block
+    confidence_threshold: 0.7
+
+# Latency budget before the fail-open/closed path triggers
+latency_budget_ms: 150
+
+# fail_open → allow on timeout | fail_closed → block on timeout
+on_timeout: fail_open

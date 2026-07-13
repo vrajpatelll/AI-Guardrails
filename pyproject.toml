@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-guardrails"
+version = "0.1.0"
+description = "Two-tier LLM guardrail system: Presidio + Qwen3Guard"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.34.0",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",          # for FastAPI TestClient
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+# Day 2 additions (add when ready):
+# presidio = ["presidio-analyzer>=2.2", "presidio-anonymizer>=2.2", "spacy>=3.7"]
+# Day 4 additions:
+# tier2 = ["transformers>=4.41", "torch>=2.3"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["guardrail*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
