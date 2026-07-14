@@ -19,7 +19,9 @@ Streaming: rejected with NotImplementedError (v2 roadmap).
 
 from __future__ import annotations
 
+import atexit
 import time
+import concurrent.futures
 from typing import Any
 
 import anthropic
@@ -27,13 +29,15 @@ import anthropic
 from guardrail.cache import VerdictCache
 from guardrail.config import GuardrailConfig
 from guardrail.detectors.tier1 import Tier1Detector
+from guardrail.logger import log_decision
 from guardrail.normalizer import normalise
-from guardrail.policy import load_policy, PolicyConfig
+from guardrail.policy import load_policy, PolicyConfig, PolicyWatcher
 from guardrail.redactor import build_redacted_text
 from guardrail.schema import Direction, GuardrailResponse
 from guardrail.verdict import (
     assemble_tier1_verdict,
     build_stub_verdict,
+    build_timeout_verdict,
     combine_verdicts,
     new_request_id,
 )
@@ -147,6 +151,23 @@ class GuardrailMiddleware:
         self._tier1: Tier1Detector = tier1 or Tier1Detector()
         self.messages = _GuardrailMessages(self)
 
+        # Thread pool for latency budget
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="guardrail-detector"
+        )
+        
+        # Policy watcher for hot reloading
+        self._watcher = PolicyWatcher(self.config.policy_path, self.reload_policy)
+        self._watcher.start()
+        
+        # Ensure clean shutdown
+        atexit.register(self.shutdown)
+
+    def shutdown(self) -> None:
+        """Cleanly stop background threads."""
+        self._watcher.stop()
+        self._executor.shutdown(wait=False)
+
     # ------------------------------------------------------------------
     # Policy reload
     # ------------------------------------------------------------------
@@ -218,8 +239,23 @@ class GuardrailMiddleware:
                 raise GuardrailBlockedError(cached)
             return self._forward_to_llm(call_kwargs, cached, messages)
 
-        # 3. Run Tier 1 detectors (both always run)
-        tier1_results = self._tier1.run(norm_text)
+        # 3. Run Tier 1 detectors with latency budget
+        try:
+            future = self._executor.submit(self._tier1.run, norm_text)
+            timeout_sec = self.policy.latency_budget_ms / 1000.0
+            tier1_results = future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            verdict = build_timeout_verdict(
+                request_id=request_id,
+                direction=Direction.INPUT,
+                policy=self.policy,
+                latency_ms=latency_ms,
+            )
+            log_decision(verdict)
+            if verdict.sanitization_result.action.value == "BLOCK":
+                raise GuardrailBlockedError(verdict)
+            return self._forward_to_llm(call_kwargs, verdict, messages)
 
         # 4. Assemble verdict
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -241,6 +277,9 @@ class GuardrailMiddleware:
 
         # 6. Cache the verdict (includes sanitized_text if set)
         self._cache.set(cache_key, verdict)
+
+        # Log decision asynchronously
+        log_decision(verdict)
 
         # 7. Block?
         if verdict.sanitization_result.action.value == "BLOCK":

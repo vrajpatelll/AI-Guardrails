@@ -22,6 +22,8 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.observers import Observer
 
 
 # ---------------------------------------------------------------------------
@@ -122,3 +124,40 @@ def get_category(config: PolicyConfig, name: str) -> CategoryPolicy | None:
     if cat is None or not cat.enabled:
         return None
     return cat
+
+
+# ---------------------------------------------------------------------------
+# Watcher
+# ---------------------------------------------------------------------------
+
+class PolicyWatcher(FileSystemEventHandler):
+    """
+    Watches the policy file and triggers a reload on modification.
+    """
+
+    def __init__(self, policy_path: str | Path, reload_callback: Any) -> None:
+        self.policy_path = Path(policy_path).resolve()
+        self.reload_callback = reload_callback
+        self._observer = Observer()
+
+    def start(self) -> None:
+        """Start the background observer thread."""
+        watch_dir = self.policy_path.parent
+        # watchdog requires a string path
+        self._observer.schedule(self, str(watch_dir), recursive=False)
+        self._observer.start()
+
+    def stop(self) -> None:
+        """Stop the background observer thread."""
+        self._observer.stop()
+        self._observer.join()
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        # Check if the modified file is exactly our policy file
+        # watchdog paths can vary slightly based on OS, so resolve both
+        try:
+            modified_path = Path(event.src_path).resolve()
+            if modified_path == self.policy_path:
+                self.reload_callback()
+        except Exception:
+            pass  # File might have been deleted mid-event, ignore

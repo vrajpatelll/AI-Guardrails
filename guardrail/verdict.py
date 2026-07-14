@@ -351,6 +351,44 @@ def combine_verdicts(
 
 
 # ---------------------------------------------------------------------------
+# Fallback / timeout builder (Day 3)
+# ---------------------------------------------------------------------------
+
+def build_timeout_verdict(
+    request_id: str,
+    direction: Direction,
+    policy: PolicyConfig,
+    latency_ms: int,
+) -> GuardrailResponse:
+    """
+    Return a fallback verdict when the latency budget is exceeded.
+    The action (ALLOW or BLOCK) depends on policy.on_timeout.
+    """
+    if policy.on_timeout.value == "fail_open":
+        action = Action.ALLOW
+    else:
+        action = Action.BLOCK
+
+    return GuardrailResponse(
+        request_id=request_id,
+        direction=direction,
+        sanitization_result=SanitizationResult(
+            filter_match_state=FilterMatchState.NO_MATCH_FOUND,
+            invocation_result=InvocationResult.TIMEOUT_FALLBACK,
+            action=action,
+            latency_ms=latency_ms,
+            sanitized_text=None,
+            filter_results={},  # no detections
+            sanitization_metadata=SanitizationMetadata(
+                cache_hit=False,
+                policy_version=policy.policy_version,
+                fallback_applied=True,
+            ),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Convenience: generate a request ID
 # ---------------------------------------------------------------------------
 
