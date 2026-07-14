@@ -39,7 +39,7 @@ from guardrail.logger import log_decision
 from guardrail.normalizer import normalise
 from guardrail.policy import load_policy, PolicyConfig, PolicyWatcher
 from guardrail.redactor import build_redacted_text
-from guardrail.schema import Direction, GuardrailResponse
+from guardrail.schema import Action, Direction, GuardrailResponse
 from guardrail.verdict import (
     assemble_verdict,
     assemble_tier1_verdict,
@@ -71,16 +71,24 @@ class GuardrailBlockedError(Exception):
 
 class GuardrailWrappedResponse:
     """
-    Thin wrapper around the real Anthropic response that adds a
-    .guardrail_verdict attribute so callers can inspect the full verdict.
+    Thin wrapper around the real Anthropic response that adds guardrail
+    verdict attributes.
+
+    .guardrail_verdict       — combined (input + output) verdict
+    .guardrail_input_verdict — input-side verdict only
+    .guardrail_output_verdict— output-side verdict (None if output guardrail skipped)
     """
     def __init__(
         self,
         anthropic_response: anthropic.types.Message,
         verdict: GuardrailResponse,
+        output_verdict: GuardrailResponse | None = None,
     ) -> None:
         self._response = anthropic_response
-        self.guardrail_verdict = verdict
+        self.guardrail_input_verdict = verdict
+        self.guardrail_output_verdict = output_verdict
+        # guardrail_verdict = combined view (strictest action wins)
+        self.guardrail_verdict = verdict  # will be replaced by combine_verdicts below
 
     def __getattr__(self, name: str) -> Any:
         """Proxy every other attribute to the real Anthropic response."""
@@ -308,6 +316,77 @@ class GuardrailMiddleware:
         # 8. Forward to LLM
         return self._forward_to_llm(call_kwargs, verdict, messages)
 
+    def _extract_response_text(self, response: anthropic.types.Message) -> str:
+        """
+        Extract plain text from an Anthropic Message response.
+        Handles text blocks in the content array.
+        """
+        parts: list[str] = []
+        for block in getattr(response, "content", []):
+            if hasattr(block, "text"):
+                parts.append(block.text)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block["text"])
+        return "\n".join(parts)
+
+    def _run_output_guardrail(
+        self,
+        response_text: str,
+        input_verdict: GuardrailResponse,
+    ) -> GuardrailResponse:
+        """
+        Run the full parallel T1+T2 guardrail pipeline on the LLM response.
+
+        Uses the same policy, executor, and detectors as the input guardrail.
+        The output verdict direction is set to OUTPUT.
+        """
+        t0 = time.monotonic()
+        request_id = input_verdict.request_id  # same request, output direction
+        norm_text = normalise(response_text)
+
+        enabled_tier2_cats = [
+            cat for cat in ("harmful_content", "prompt_injection")
+            if (cp := self.policy.categories.get(cat)) and cp.enabled
+        ]
+        timeout_sec = self.policy.latency_budget_ms / 1000.0
+
+        try:
+            f1 = self._executor.submit(self._tier1.run, norm_text)
+            f2 = self._executor.submit(self._tier2.run, norm_text, enabled_tier2_cats)
+            tier1_results = f1.result(timeout=timeout_sec)
+            elapsed = time.monotonic() - t0
+            remaining = max(0.0, timeout_sec - elapsed)
+            tier2_results = f2.result(timeout=remaining + 0.5)
+        except Exception:
+            # Output guardrail failure → fail-open (don't block user's response)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            return build_timeout_verdict(
+                request_id=request_id,
+                direction=Direction.OUTPUT,
+                policy=self.policy,
+                latency_ms=latency_ms,
+            )
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        output_verdict, redactable = assemble_verdict(
+            request_id=request_id,
+            direction=Direction.OUTPUT,
+            policy=self.policy,
+            tier1_results=tier1_results,
+            tier2_results=tier2_results,
+            normalised_text=norm_text,
+            latency_ms=latency_ms,
+        )
+
+        # Apply redaction on output text if needed
+        if output_verdict.sanitization_result.action == Action.REDACT and redactable:
+            output_verdict.sanitization_result.sanitized_text = build_redacted_text(
+                norm_text, redactable
+            )
+
+        log_decision(output_verdict)
+        return output_verdict
+
     def _forward_to_llm(
         self,
         call_kwargs: dict[str, Any],
@@ -315,11 +394,18 @@ class GuardrailMiddleware:
         original_messages: list[dict[str, Any]],
     ) -> GuardrailWrappedResponse:
         """
-        Forward the (possibly sanitized) request to Anthropic.
+        Forward the (possibly sanitized) request to Anthropic, then run the
+        output guardrail on the LLM response.
 
-        If action=REDACT: replaces the last user message content with
-        verdict.sanitization_result.sanitized_text so the LLM never sees
-        the raw PII / secret.
+        Input side:
+          - action=REDACT: replaces the last user message with sanitized_text.
+          - action=ALLOW:  forwards unchanged.
+
+        Output side (Day 5):
+          - Runs T1+T2 on the LLM response text.
+          - action=BLOCK:  raises GuardrailBlockedError (LLM response suppressed).
+          - action=REDACT: replaces response content with sanitized_text.
+          - action=ALLOW:  returns response unchanged.
         """
         forward_kwargs = dict(call_kwargs)
 
@@ -334,9 +420,27 @@ class GuardrailMiddleware:
 
         raw_response = self._anthropic.messages.create(**forward_kwargs)
 
-        # TODO (Day 5): run output guardrail on raw_response.content here
+        # Output guardrail
+        response_text = self._extract_response_text(raw_response)
+        output_verdict = self._run_output_guardrail(response_text, verdict)
+        combined_verdict = combine_verdicts(verdict, output_verdict)
 
-        return GuardrailWrappedResponse(
+        if combined_verdict.sanitization_result.action.value == "BLOCK":
+            raise GuardrailBlockedError(combined_verdict)
+
+        # If output was REDACT, swap the response text
+        out_sanitized = output_verdict.sanitization_result.sanitized_text
+        if out_sanitized is not None:
+            # Mutate the first text block in the response content
+            for block in getattr(raw_response, "content", []):
+                if hasattr(block, "text"):
+                    block.text = out_sanitized
+                    break
+
+        wrapped = GuardrailWrappedResponse(
             anthropic_response=raw_response,
-            verdict=verdict,
+            verdict=combined_verdict,
+            output_verdict=output_verdict,
         )
+        wrapped.guardrail_verdict = combined_verdict
+        return wrapped

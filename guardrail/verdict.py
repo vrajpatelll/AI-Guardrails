@@ -508,11 +508,73 @@ def combine_verdicts(
     """
     Merge input + output verdicts into one final response.
 
-    Day 1/2: returns input_verdict unchanged (output guardrail is Day 5).
-    BLOCK always beats REDACT (enforced by determine_action).
+    The combined response keeps the input verdict's request_id and metadata,
+    but merges filter_results from both directions and takes the STRICTER of
+    the two actions (BLOCK > REDACT > ALLOW).
+
+    If output_verdict is None (output guardrail disabled or not yet run),
+    returns input_verdict unchanged.
+
+    Day 5: real implementation.
     """
-    # TODO (Day 5): merge output_verdict filter_results
-    return input_verdict
+    if output_verdict is None:
+        return input_verdict
+
+    # Merge filter_results — prefix output categories to distinguish them
+    merged_filter_results = dict(input_verdict.sanitization_result.filter_results)
+    for cat_name, cat_result in output_verdict.sanitization_result.filter_results.items():
+        merged_filter_results[f"output_{cat_name}"] = cat_result
+
+    # Stricter action wins: BLOCK > REDACT > ALLOW
+    action_rank = {Action.ALLOW: 0, Action.REDACT: 1, Action.BLOCK: 2}
+    input_action = input_verdict.sanitization_result.action
+    output_action = output_verdict.sanitization_result.action
+    final_action = (
+        input_action if action_rank[input_action] >= action_rank[output_action]
+        else output_action
+    )
+
+    # If output triggers BLOCK but input was ALLOW/REDACT, clear sanitized_text
+    sanitized_text = input_verdict.sanitization_result.sanitized_text
+    if final_action == Action.BLOCK:
+        sanitized_text = None
+
+    # Top-level match state: MATCH if either direction matched
+    input_match = input_verdict.sanitization_result.filter_match_state
+    output_match = output_verdict.sanitization_result.filter_match_state
+    final_match = (
+        FilterMatchState.MATCH_FOUND
+        if FilterMatchState.MATCH_FOUND in (input_match, output_match)
+        else FilterMatchState.NO_MATCH_FOUND
+    )
+
+    # Combine latency
+    combined_latency_ms = (
+        input_verdict.sanitization_result.latency_ms
+        + output_verdict.sanitization_result.latency_ms
+    )
+
+    return GuardrailResponse(
+        request_id=input_verdict.request_id,
+        direction=input_verdict.direction,
+        sanitization_result=SanitizationResult(
+            filter_match_state=final_match,
+            invocation_result=InvocationResult.SUCCESS,
+            action=final_action,
+            latency_ms=combined_latency_ms,
+            sanitized_text=sanitized_text,
+            filter_results=merged_filter_results,
+            sanitization_metadata=SanitizationMetadata(
+                cache_hit=input_verdict.sanitization_result.sanitization_metadata.cache_hit,
+                policy_version=input_verdict.sanitization_result.sanitization_metadata.policy_version,
+                fallback_applied=(
+                    input_verdict.sanitization_result.sanitization_metadata.fallback_applied
+                    or output_verdict.sanitization_result.sanitization_metadata.fallback_applied
+                ),
+            ),
+        ),
+    )
+
 
 
 # ---------------------------------------------------------------------------
