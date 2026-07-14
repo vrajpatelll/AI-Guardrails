@@ -2,20 +2,25 @@
 SDK middleware: wraps an Anthropic client and intercepts every
 messages.create() call to run the guardrail pipeline.
 
-Day 2 pipeline (Tier 1 wired, Tier 2 still stub):
+Day 4 pipeline (both tiers, concurrent):
   1. Normalise text extracted from messages array.
   2. Check verdict cache (key = hash(norm_text + policy_version)).
-  3. Run Tier1Detector (PII + secrets — both always run).
-  4. Assemble CategoryResult objects via assemble_tier1_verdict().
-  5. Determine combined action (BLOCK > REDACT > ALLOW).
+  3. Submit Tier 1 (PII + secrets) AND Tier 2 (harmful_content + prompt_injection)
+     concurrently to the thread pool executor.
+  4. Wait for both futures within the latency budget; timeout → fallback verdict.
+  5. Assemble combined CategoryResult objects via assemble_verdict().
   6. If REDACT: build sanitized_text via build_redacted_text().
   7. Cache verdict + sanitized_text.
   8. If BLOCK: raise GuardrailBlockedError (no LLM call).
   9. Forward original (ALLOW) or sanitized (REDACT) text to Anthropic.
- 10. [Day 5] Output guardrail stub.
+
+CRITICAL: Tier 1 and Tier 2 check UNRELATED categories.
+Tier 2 is NEVER skipped because Tier 1 was clean.
+Both are always submitted. The only valid skip is category disabled in policy.yaml.
 
 Streaming: rejected with NotImplementedError (v2 roadmap).
 """
+
 
 from __future__ import annotations
 
@@ -29,12 +34,14 @@ import anthropic
 from guardrail.cache import VerdictCache
 from guardrail.config import GuardrailConfig
 from guardrail.detectors.tier1 import Tier1Detector
+from guardrail.detectors.tier2 import Tier2Detector
 from guardrail.logger import log_decision
 from guardrail.normalizer import normalise
 from guardrail.policy import load_policy, PolicyConfig, PolicyWatcher
 from guardrail.redactor import build_redacted_text
 from guardrail.schema import Direction, GuardrailResponse
 from guardrail.verdict import (
+    assemble_verdict,
     assemble_tier1_verdict,
     build_stub_verdict,
     build_timeout_verdict,
@@ -149,6 +156,7 @@ class GuardrailMiddleware:
             api_key=config.llm_api_key.get_secret_value()
         )
         self._tier1: Tier1Detector = tier1 or Tier1Detector()
+        self._tier2: Tier2Detector = Tier2Detector()  # lazy-loaded on first call
         self.messages = _GuardrailMessages(self)
 
         # Thread pool for latency budget
@@ -239,11 +247,22 @@ class GuardrailMiddleware:
                 raise GuardrailBlockedError(cached)
             return self._forward_to_llm(call_kwargs, cached, messages)
 
-        # 3. Run Tier 1 detectors with latency budget
+        # 3. Submit Tier 1 + Tier 2 concurrently — BOTH always run
+        #    (only valid skip is category disabled in policy.yaml)
+        enabled_tier2_cats = [
+            cat for cat in ("harmful_content", "prompt_injection")
+            if (cp := self.policy.categories.get(cat)) and cp.enabled
+        ]
+        timeout_sec = self.policy.latency_budget_ms / 1000.0
         try:
-            future = self._executor.submit(self._tier1.run, norm_text)
-            timeout_sec = self.policy.latency_budget_ms / 1000.0
-            tier1_results = future.result(timeout=timeout_sec)
+            f1 = self._executor.submit(self._tier1.run, norm_text)
+            f2 = self._executor.submit(self._tier2.run, norm_text, enabled_tier2_cats)
+            # Wait for both — wall-clock cost = max(tier1, tier2) not sum
+            tier1_results = f1.result(timeout=timeout_sec)
+            # Remaining budget for tier2
+            elapsed = time.monotonic() - t0
+            remaining = max(0.0, timeout_sec - elapsed)
+            tier2_results = f2.result(timeout=remaining + 0.5)  # small grace
         except concurrent.futures.TimeoutError:
             latency_ms = int((time.monotonic() - t0) * 1000)
             verdict = build_timeout_verdict(
@@ -257,13 +276,14 @@ class GuardrailMiddleware:
                 raise GuardrailBlockedError(verdict)
             return self._forward_to_llm(call_kwargs, verdict, messages)
 
-        # 4. Assemble verdict
+        # 4. Assemble combined verdict from both tiers
         latency_ms = int((time.monotonic() - t0) * 1000)
-        verdict, redactable = assemble_tier1_verdict(
+        verdict, redactable = assemble_verdict(
             request_id=request_id,
             direction=Direction.INPUT,
             policy=self.policy,
             tier1_results=tier1_results,
+            tier2_results=tier2_results,
             normalised_text=norm_text,
             latency_ms=latency_ms,
             cache_hit=False,
