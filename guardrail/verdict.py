@@ -8,10 +8,15 @@ Day 4: assemble_verdict() — both tiers concurrent, BLOCK > REDACT > ALLOW.
 
 Key rules (from CRITICAL constraints):
 - Tier 1 (pii, secrets) and Tier 2 (harmful_content, prompt_injection)
-  are INDEPENDENT. Both always run unless the category is disabled.
-  There is NO cascade skip based on Tier 1 results.
+  are otherwise INDEPENDENT. Both always run unless the category is
+  disabled. The ONLY cascade skip: Tier 1 secrets already resolving to
+  BLOCK (the strictest possible action — Tier 2 can't add anything).
+  A Tier 1 REDACT (pii) alone still waits for Tier 2.
 - BLOCK always beats REDACT when combining category actions.
 - When the combined action is REDACT, sanitized_text must be set.
+- Tier 2 has its own timeout (tier2_timeout_ms) independent of Tier 1's
+  latency_budget_ms/on_timeout. Exceeding it always fails CLOSED (BLOCK) —
+  see build_tier2_timeout_verdict().
 """
 
 from __future__ import annotations
@@ -135,9 +140,10 @@ def assemble_tier1_verdict(
     normalised_text: str,
     latency_ms: int = 0,
     cache_hit: bool = False,
+    tier2_skip_reason: str = "skipped: tier 2 not yet wired (Day 4)",
 ) -> tuple[GuardrailResponse, list["DetectionResult"]]:
     """
-    Build a GuardrailResponse from Tier 1 detector output.
+    Build a GuardrailResponse from Tier 1 detector output alone.
 
     Returns:
         (verdict, redactable_detections)
@@ -146,7 +152,8 @@ def assemble_tier1_verdict(
         (used by the caller to build sanitized_text via build_redacted_text).
 
     Tier 2 categories (harmful_content, prompt_injection) are set to
-    NOT_EVALUATED here — they are wired in on Day 4.
+    NOT_EVALUATED here, with `tier2_skip_reason` explaining why (e.g. Tier 2
+    not wired yet, category disabled, or Tier 1 secrets already forced BLOCK).
     """
     # --- Build per-category results ----------------------------------------
 
@@ -216,7 +223,7 @@ def assemble_tier1_verdict(
                 match_state=MatchState.NA,
                 tier=2,
                 model=CATEGORY_MODEL.get(cat_name),
-                reason="skipped: tier 2 not yet wired (Day 4)",
+                reason=tier2_skip_reason,
             )
 
     # --- Determine combined action -----------------------------------------
@@ -613,6 +620,42 @@ def build_timeout_verdict(
             ),
         ),
     )
+
+
+def build_tier2_timeout_verdict(
+    request_id: str,
+    direction: Direction,
+    policy: PolicyConfig,
+    tier1_results: "Tier1Results",
+    normalised_text: str,
+    latency_ms: int,
+) -> GuardrailResponse:
+    """
+    Tier 1 completed (and didn't already force BLOCK) but Tier 2 exceeded
+    policy.tier2_timeout_ms. Always fails CLOSED, unlike build_timeout_verdict
+    — semantically-unscanned text (harmful_content, prompt_injection) must
+    never reach the LLM just because the model was slow.
+    """
+    verdict, _ = assemble_tier1_verdict(
+        request_id=request_id,
+        direction=direction,
+        policy=policy,
+        tier1_results=tier1_results,
+        normalised_text=normalised_text,
+        latency_ms=latency_ms,
+        cache_hit=False,
+        tier2_skip_reason=f"tier 2 exceeded tier2_timeout_ms ({policy.tier2_timeout_ms}ms) — failing closed",
+    )
+
+    sr = verdict.sanitization_result
+    for cat_name in ("harmful_content", "prompt_injection"):
+        if cat_name in sr.filter_results:
+            sr.filter_results[cat_name].execution_state = ExecutionState.TIMEOUT
+    sr.action = Action.BLOCK
+    sr.sanitized_text = None
+    sr.invocation_result = InvocationResult.TIMEOUT_FALLBACK
+    sr.sanitization_metadata.fallback_applied = True
+    return verdict
 
 
 # ---------------------------------------------------------------------------

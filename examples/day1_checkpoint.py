@@ -6,7 +6,7 @@ Run this after setting up your .env to verify:
   ✓ Config loads from environment
   ✓ Normalizer works on obfuscated text
   ✓ Cache key changes when policy_version changes
-  ✓ A real call through the wrapped Anthropic client returns a response
+  ✓ A real call through the wrapped LLM gateway client returns a response
     wrapped in a schema-valid no-op guardrail verdict
 
 Usage:
@@ -97,12 +97,12 @@ def main() -> None:
         print(f"     fail_mode: {cfg.fail_mode}")
     except ValueError as e:
         print(f"\n  ⚠  Skipping live LLM test: {e}")
-        print("     Set ANTHROPIC_API_KEY and GUARDRAIL_TOKEN in .env to run the full checkpoint.")
+        print("     Set LLM_GATEWAY_API_KEY and GUARDRAIL_TOKEN in .env to run the full checkpoint.")
         print("\n  ✓  Day 1 structural checkpoint PASSED (no live LLM call made)\n")
         return
 
     # ── 5. Live LLM pass-through ──────────────────────────────────────
-    section("5. Live LLM pass-through (real Anthropic call)")
+    section("5. Live LLM pass-through (real gateway call)")
     policy_fresh = load_policy("policy.yaml")
     client = GuardrailMiddleware(cfg, policy=policy_fresh)
 
@@ -115,7 +115,7 @@ def main() -> None:
     verdict = response.guardrail_verdict
     sr = verdict.sanitization_result
 
-    check("response has content", len(response.content) > 0)
+    check("response has choices", len(response.choices) > 0)
     check("guardrail_verdict is attached", verdict is not None)
     check("action is ALLOW", sr.action.value == "ALLOW")
     check("filter_match_state is NO_MATCH_FOUND", sr.filter_match_state.value == "NO_MATCH_FOUND")
@@ -123,7 +123,7 @@ def main() -> None:
     check("all 4 categories in filter_results", len(sr.filter_results) >= 4)
     check("sanitized_text is None (no redactions)", sr.sanitized_text is None)
 
-    print(f"\n  LLM reply: {response.content[0].text!r}")
+    print(f"\n  LLM reply: {response.choices[0].message.content!r}")
     print("\n  Full guardrail verdict:")
     print(json.dumps(verdict.model_dump(), indent=4, default=str))
 

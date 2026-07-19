@@ -18,8 +18,14 @@ Presidio's AnalyzerEngine is thread-safe after initialisation.
 
 from __future__ import annotations
 
+import logging
+import re
+import time
 from dataclasses import dataclass, field
-from typing import Sequence
+from functools import lru_cache
+from typing import TYPE_CHECKING, Sequence
+
+logger = logging.getLogger(__name__)
 
 # Presidio - imported so the module can be imported even if presidio
 # isn't installed (ImportError only when Tier1Detector() is instantiated).
@@ -30,6 +36,9 @@ except ImportError:  # pragma: no cover
     _PRESIDIO_AVAILABLE = False
 
 from guardrail.detectors.patterns import CATALOG, SecretPattern
+
+if TYPE_CHECKING:
+    from guardrail.policy import PolicyConfig
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +108,10 @@ class PiiDetector:
                 "Run: pip install presidio-analyzer presidio-anonymizer spacy "
                 "&& python -m spacy download en_core_web_lg"
             )
+        t0 = time.monotonic()
+        logger.info("Tier 1: loading Presidio AnalyzerEngine (spaCy model)…")
         self._engine = AnalyzerEngine()
+        logger.info("Tier 1: AnalyzerEngine ready (%.0fms)", (time.monotonic() - t0) * 1000)
 
     def run(
         self,
@@ -198,6 +210,52 @@ class SecretsDetector:
 
 
 # ---------------------------------------------------------------------------
+# Deny-list sub-detector (policy-driven keywords/regex)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=256)
+def _compile_deny_pattern(raw: str) -> re.Pattern[str]:
+    """
+    Compile one policy.yaml `deny_patterns` entry.
+
+    Most org-specific entries are plain words/phrases (internal codenames,
+    custom ID prefixes) rather than intentional regex, so a string that
+    isn't valid regex (unbalanced brackets, etc.) is treated as a literal
+    via re.escape() instead of raising - a typo in policy.yaml shouldn't
+    take down the detector. Case-insensitive either way.
+    """
+    try:
+        return re.compile(raw, re.IGNORECASE)
+    except re.error:
+        return re.compile(re.escape(raw), re.IGNORECASE)
+
+
+class DenyListDetector:
+    """
+    Deterministic keyword/regex matcher for `CategoryPolicy.deny_patterns` -
+    org-specific terms (internal codenames, custom ID formats) that Presidio
+    and the built-in secrets catalog don't know about and can't be taught
+    without a code change. Every match is confidence=1.0: there's no model
+    uncertainty in a literal/regex match, unlike Presidio's PII scores.
+    """
+
+    def run(self, text: str, category: str, patterns: Sequence[str]) -> list[DetectionResult]:
+        results: list[DetectionResult] = []
+        for raw in patterns:
+            compiled = _compile_deny_pattern(raw)
+            for match in compiled.finditer(text):
+                results.append(DetectionResult(
+                    category=f"DENY_LIST:{raw}",
+                    start=match.start(),
+                    end=match.end(),
+                    confidence=1.0,
+                    rule=f"policy.deny_pattern[{category}]",
+                ))
+        results.sort(key=lambda d: d.start)
+        return results
+
+
+# ---------------------------------------------------------------------------
 # Tier 1 orchestrator
 # ---------------------------------------------------------------------------
 
@@ -216,18 +274,50 @@ class Tier1Detector:
     ) -> None:
         self._pii = PiiDetector()
         self._secrets = SecretsDetector(extra_patterns=extra_secret_patterns)
+        self._deny_list = DenyListDetector()
 
-    def run(self, normalised_text: str) -> Tier1Results:
+    def run(
+        self,
+        normalised_text: str,
+        policy: "PolicyConfig | None" = None,
+    ) -> Tier1Results:
         """
         Run both sub-detectors on `normalised_text`.
 
         Args:
             normalised_text: Text that has already been through normalise().
+            policy: Optional PolicyConfig. When given, each category's
+                    deny_patterns (pii, secrets) are also matched and folded
+                    into that category's result list alongside the built-in
+                    detections. Passed per-call (not baked in at construction)
+                    so policy hot-reloads take effect immediately, same as
+                    every other threshold/action in policy.yaml.
 
         Returns:
             Tier1Results with pii and secrets lists.
         """
+        t0 = time.monotonic()
         pii_hits = self._pii.run(normalised_text)
         secret_hits = self._secrets.run(normalised_text)
+
+        if policy is not None:
+            pii_policy = policy.categories.get("pii")
+            if pii_policy and pii_policy.deny_patterns:
+                pii_hits = pii_hits + self._deny_list.run(
+                    normalised_text, "pii", pii_policy.deny_patterns
+                )
+                pii_hits.sort(key=lambda d: d.start)
+
+            secrets_policy = policy.categories.get("secrets")
+            if secrets_policy and secrets_policy.deny_patterns:
+                secret_hits = secret_hits + self._deny_list.run(
+                    normalised_text, "secrets", secrets_policy.deny_patterns
+                )
+                secret_hits.sort(key=lambda d: d.start)
+
+        logger.info(
+            "Tier 1: result pii=%d secrets=%d (%.0fms)",
+            len(pii_hits), len(secret_hits), (time.monotonic() - t0) * 1000,
+        )
 
         return Tier1Results(pii=pii_hits, secrets=secret_hits)

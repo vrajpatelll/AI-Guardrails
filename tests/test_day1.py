@@ -19,7 +19,7 @@ import pytest
 
 from guardrail.cache import VerdictCache
 from guardrail.config import GuardrailConfig
-from guardrail.normalizer import normalise
+from guardrail.normalizer import normalise, try_decode_base64
 from guardrail.policy import load_policy, PolicyConfig, CategoryPolicy
 from guardrail.schema import (
     Action,
@@ -180,6 +180,43 @@ class TestNormalizer:
         assert result == "abcd"
 
 
+class TestBase64Decode:
+    def test_decodes_valid_base64(self):
+        # base64.b64encode(b"my email is alice@example.com")
+        encoded = "bXkgZW1haWwgaXMgYWxpY2VAZXhhbXBsZS5jb20="
+        assert try_decode_base64(encoded) == "my email is alice@example.com"
+
+    def test_ignores_surrounding_whitespace(self):
+        encoded = "  aGVsbG8gd29ybGQ=  \n"
+        assert try_decode_base64(encoded) == "hello world"
+
+    def test_plain_text_returns_none(self):
+        assert try_decode_base64("hello, how are you today?") is None
+
+    def test_short_string_returns_none(self):
+        # "abcd" is valid base64 but far too short to trust \u2014 plenty of
+        # ordinary short words/codes would false-positive otherwise.
+        assert try_decode_base64("abcd") is None
+
+    def test_wrong_length_returns_none(self):
+        assert try_decode_base64("abcde") is None
+
+    def test_invalid_characters_return_none(self):
+        assert try_decode_base64("not valid base64 text!!") is None
+
+    def test_binary_garbage_returns_none(self):
+        # Valid base64 alphabet/length/UTF-8-in-parts but mostly control
+        # bytes once decoded \u2014 shouldn't be treated as a text payload.
+        import base64
+        encoded = base64.b64encode(bytes(range(0, 20))).decode()
+        assert try_decode_base64(encoded) is None
+
+    def test_non_utf8_bytes_return_none(self):
+        import base64
+        encoded = base64.b64encode(b"\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6\xf5\xf4").decode()
+        assert try_decode_base64(encoded) is None
+
+
 # ---------------------------------------------------------------------------
 # Cache tests
 # ---------------------------------------------------------------------------
@@ -275,13 +312,13 @@ class TestStubVerdict:
 
 class TestGuardrailConfig:
     def test_from_env_raises_on_missing_keys(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
         monkeypatch.delenv("GUARDRAIL_TOKEN", raising=False)
-        with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        with pytest.raises(ValueError, match="LLM_GATEWAY_API_KEY"):
             GuardrailConfig.from_env()
 
     def test_safe_dict_redacts_secrets(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-key")
+        monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-real-key")
         monkeypatch.setenv("GUARDRAIL_TOKEN", "real-token")
         cfg = GuardrailConfig.from_env()
         safe = cfg.safe_dict()
@@ -297,7 +334,7 @@ class TestGuardrailConfig:
             )
 
     def test_log_level_uppercased(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        monkeypatch.setenv("LLM_GATEWAY_API_KEY", "k")
         monkeypatch.setenv("GUARDRAIL_TOKEN", "t")
         monkeypatch.setenv("GUARDRAIL_LOG_LEVEL", "debug")
         cfg = GuardrailConfig.from_env()

@@ -4,12 +4,17 @@ categories:
   pii:
     enabled: true
     action: redact            # PII gets redacted, not blocked
-    confidence_threshold: 0.8
+    confidence_threshold: 0.4
 
   secrets:
     enabled: true
     action: block             # API keys / credentials always block
     confidence_threshold: 0.7
+    # Org-specific literal/regex terms the regex catalog can't know about
+    # (internal codenames, custom internal ID formats). Matches are
+    # deterministic (confidence 1.0) and hot-reload with the rest of this
+    # file - edit and save, no restart needed.
+    deny_patterns: []
 
   harmful_content:
     enabled: true
@@ -20,9 +25,65 @@ categories:
     enabled: true
     action: block
     confidence_threshold: 0.7
+    # Deterministic pre-check used by the "Try it" / Streamlit playgrounds for
+    # the human-in-the-loop approval gate: a match here pauses the request for
+    # a human to approve/reject BEFORE the Tier 2 model or the LLM ever see
+    # it. Not solely trusting the semantic model's jailbreak recall here is
+    # intentional — see guardrail/detectors/tier2.py's module docstring.
+    # Hot-reloads with the rest of this file, same as every other field.
+    # Mirrors the technique categories also described in Tier 2's system
+    # prompt (guardrail/detectors/tier2.py), so wording that doesn't match
+    # one of these regexes literally still has a shot at being caught
+    # semantically by the model.
+    deny_patterns:
+      # 1. Direct instruction override & goal hijacking
+      - 'ignore (all |the )?(previous|above|prior) (instructions|directives|rules|prompts|system)'
+      - 'disregard (your|all|previous) (guidelines|instructions|rules|prompts|system)'
+      - 'override (all|system) (instructions|prompts|rules)'
+      - 'forget (everything|all|your|previous) (you|instructions|rules|were told)'
+      - 'bypass (all |your )?(safety|content|ethical|security|system) (filters|guidelines|rules|policies|checks)'
+      - 'no longer bound by'
+      - 'system override'
 
-# Latency budget before the fail-open/closed path triggers
+      # 2. System prompt & hidden-context exfiltration
+      - '(reveal|show|print|output|display|repeat) (your|the) (system|initial|original|hidden) (prompt|instructions|context)'
+      - 'what (are|were) your (initial|system|original) (instructions|prompts)'
+      - 'repeat the text above'
+      - 'spell out your system prompt'
+      - 'output everything before this line'
+
+      # 3. Roleplay, personas, and fake unrestricted modes
+      - 'you are now (DAN|STAN|DUDE|AIM|Mongo Tom|AntiGPT|an unfiltered)'
+      - '(DAN|developer|god|maintenance|unrestricted|unfiltered) mode'
+      - 'act as an? (ai|assistant|model) with no (restrictions|filters|rules|boundaries)'
+      - 'pretend (you have|to have|you are|you''re) (no|without) (restrictions|rules|filters|boundaries)'
+      - 'roleplay as (a|an) (evil|unrestricted|rogue) (ai|assistant)'
+      - 'hypothetically speaking, without any safety checks'
+
+      # 4. Context-boundary injection & delimiter spoofing
+      - '--- ?(END|BEGIN) (SYSTEM|PROMPT|CONTEXT) ?---'
+      - '</?(system|im_start|im_end|developer|instructions)>'
+      - '\[SYSTEM PROMPT\]'
+      - '\[ADMIN INSTRUCTION\]'
+
+      # 5. Output-formatting coercion & refusal suppression
+      - '(do not|never|don''t) (use|include|say) (words|phrases) (like|such as) (cannot|sorry|unable|policy)'
+      - 'start your (response|answer) with (exactly )?["''](sure|yes|ok|here is)'
+      - 'without any (disclaimers|warnings|moralizing|refusals)'
+
+      # (originally hand-picked examples, kept for coverage the categories
+      # above don't already generalize)
+      - "jailbreak"
+      - "unfiltered AI"
+
+# Latency budget for Tier 1 (pii, secrets) before the fail-open/closed path triggers
 latency_budget_ms: 150
 
-# fail_open → allow on timeout | fail_closed → block on timeout
+# fail_open → allow on Tier 1 timeout | fail_closed → block on Tier 1 timeout
 on_timeout: fail_open
+
+# Ceiling for waiting on Tier 2 (semantic model) when Tier 1 hasn't already
+# forced BLOCK via secrets. Exceeding this always fails CLOSED (BLOCK).
+# Measured warm inference on this model is ~3.5-4.5s CPU-only; 30s leaves
+# headroom while evaluation is ongoing.
+tier2_timeout_ms: 30000

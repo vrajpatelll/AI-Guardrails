@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from dotenv import load_dotenv
@@ -5,6 +6,16 @@ from dotenv import load_dotenv
 # Load environment variables FIRST before importing guardrail components
 # which might try to read os.environ at import time or initialization time.
 load_dotenv()
+
+# Make guardrail.* INFO logs (tier1/tier2 loading, pipeline progress, cache
+# hits, timeouts) visible on the console — without this, module loggers have
+# no handler attached and everything is silently dropped, which is why
+# slow steps like the Tier 2 model load look like a hang instead of progress.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 from guardrail.config import GuardrailConfig
 from guardrail.middleware import GuardrailMiddleware
@@ -38,7 +49,7 @@ def main():
                 
                 t0 = time.time()
                 resp = middleware.messages.create(
-                    model="claude-3-5-haiku-20241022",
+                    model=cfg.llm_model,
                     max_tokens=100,
                     messages=[{"role": "user", "content": user_input}]
                 )
@@ -57,7 +68,7 @@ def main():
                 elif sr.action.value == "ALLOW":
                     # For ALLOW, the input was passed to LLM unmodified.
                     # We didn't actually call the LLM to get a reply in this demo to save cost/time,
-                    # but normally resp.content would have the LLM's answer.
+                    # but normally resp.choices[0].message.content would have the LLM's answer.
                     pass
                 
             except Exception as e:

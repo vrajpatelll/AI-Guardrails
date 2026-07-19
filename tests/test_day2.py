@@ -25,7 +25,7 @@ from guardrail.detectors.tier1 import Tier1Detector, Tier1Results
 from guardrail.normalizer import normalise
 from guardrail.policy import load_policy, PolicyConfig
 from guardrail.redactor import build_redacted_text
-from guardrail.schema import Action, ExecutionState, FilterMatchState, MatchState
+from guardrail.schema import Action, Direction, ExecutionState, FilterMatchState, MatchState
 from guardrail.verdict import assemble_tier1_verdict, determine_action
 from pathlib import Path
 
@@ -269,6 +269,101 @@ class TestSecretsPrivateKey:
         pem = [d for d in results.secrets if d.category == "PRIVATE_KEY_PEM"]
         assert pem, "Expected PRIVATE_KEY_PEM detection"
         assert pem[0].confidence == 1.0
+
+
+# ---------------------------------------------------------------------------
+# 9b. Deny-list patterns (policy.yaml `deny_patterns`, org-specific terms)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def deny_list_policy(tmp_path: Path) -> PolicyConfig:
+    """Policy with deny_patterns on secrets (literal) and pii (regex)."""
+    yaml_text = """
+name: deny-list-test
+categories:
+  pii:
+    enabled: true
+    action: redact
+    confidence_threshold: 0.5
+    deny_patterns:
+      - "internal-id-\\\\d{4}"
+  secrets:
+    enabled: true
+    action: block
+    confidence_threshold: 0.7
+    deny_patterns:
+      - "Project Nightingale"
+      - "[unbalanced("
+  harmful_content:
+    enabled: true
+    action: block
+  prompt_injection:
+    enabled: true
+    action: block
+latency_budget_ms: 150
+on_timeout: fail_open
+"""
+    p = tmp_path / "deny_policy.yaml"
+    p.write_text(yaml_text)
+    return load_policy(p)
+
+
+class TestDenyPatterns:
+    def test_literal_keyword_matched_case_insensitively(
+        self, detector: Tier1Detector, deny_list_policy: PolicyConfig
+    ):
+        text = "Codename for the launch is project nightingale, keep it quiet."
+        norm = normalise(text)
+        results = detector.run(norm, deny_list_policy)
+        hits = [d for d in results.secrets if d.category.startswith("DENY_LIST:")]
+        assert hits, "Expected a deny_patterns hit on the secrets category"
+        assert hits[0].confidence == 1.0
+        assert norm[hits[0].start:hits[0].end].lower() == "project nightingale"
+
+    def test_regex_pattern_matched(self, detector: Tier1Detector, deny_list_policy: PolicyConfig):
+        text = "Please reference internal-id-4471 on the ticket."
+        norm = normalise(text)
+        results = detector.run(norm, deny_list_policy)
+        hits = [d for d in results.pii if d.category.startswith("DENY_LIST:")]
+        assert hits, "Expected a deny_patterns hit on the pii category"
+        assert norm[hits[0].start:hits[0].end] == "internal-id-4471"
+
+    def test_invalid_regex_falls_back_to_literal_match(
+        self, detector: Tier1Detector, deny_list_policy: PolicyConfig
+    ):
+        # "[unbalanced(" is not valid regex — must not raise, and must still
+        # match itself literally rather than being silently dropped.
+        text = "the raw string [unbalanced( appeared in the log"
+        norm = normalise(text)
+        results = detector.run(norm, deny_list_policy)
+        hits = [d for d in results.secrets if "[unbalanced(" in d.category]
+        assert hits
+
+    def test_no_deny_patterns_configured_is_a_no_op(
+        self, detector: Tier1Detector, policy: PolicyConfig
+    ):
+        # `policy` fixture has no deny_patterns at all — passing it through
+        # must behave exactly like calling run() without a policy.
+        text = "Project Nightingale is mentioned here but policy has no deny_patterns."
+        with_policy = detector.run(normalise(text), policy)
+        without_policy = detector.run(normalise(text))
+        assert with_policy.pii == without_policy.pii
+        assert with_policy.secrets == without_policy.secrets
+
+    def test_deny_pattern_hit_forces_block_via_verdict(
+        self, detector: Tier1Detector, deny_list_policy: PolicyConfig
+    ):
+        text = "Reference: Project Nightingale rollout plan."
+        norm = normalise(text)
+        results = detector.run(norm, deny_list_policy)
+        verdict, _ = assemble_tier1_verdict(
+            request_id="req_test",
+            direction=Direction.INPUT,
+            policy=deny_list_policy,
+            tier1_results=results,
+            normalised_text=norm,
+        )
+        assert verdict.sanitization_result.action == Action.BLOCK
 
 
 # ---------------------------------------------------------------------------

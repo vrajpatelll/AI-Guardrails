@@ -1,0 +1,8 @@
+[server]
+# Disables Streamlit's module-path file watcher. Without this, it walks
+# every imported module (including transformers' vision-model submodules,
+# which need torchvision - not installed and not used, since Tier 2 only
+# loads a text-only causal LM) and logs a harmless but noisy traceback for
+# each one it can't introspect. Trade-off: editing streamlit_app.py now
+# requires a manual browser refresh instead of auto-reloading.
+fileWatcherType = "none"

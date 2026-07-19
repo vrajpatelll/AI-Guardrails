@@ -6,6 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+# Graphify Deps
+graphify-out/
+
+# Guardrail decision log (dashboard data source)
+logs/
+
 # Distribution / packaging
 .Python
 build/
@@ -150,6 +156,11 @@ activemq-data/
 # Environments
 .env
 .envrc
+
+# Secrets / certs
+*.crt
+*.pem
+*.key
 .venv
 env/
 venv/

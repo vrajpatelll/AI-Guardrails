@@ -2,11 +2,13 @@
 Integrator-facing connection config (Section 4 of development-plan.md).
 
 Mandatory fields (can't run without them):
-  - llm_api_key:     Anthropic API key for the wrapped LLM
+  - llm_api_key:     API key for the wrapped LLM gateway
   - guardrail_token: auth token protecting the guardrail endpoint
 
 Optional fields (sensible defaults ship, real users will override):
-  - llm_model:       which Anthropic model to use
+  - llm_model:       which gateway model to use
+  - llm_base_url:    base URL of the LLM gateway (OpenAI-compatible)
+  - llm_cert_path:   path to a CA cert file for verifying the gateway's TLS cert
   - policy_path:     path to policy.yaml
   - cache_ttl:       verdict cache TTL in seconds
   - log_level:       async logger verbosity
@@ -15,9 +17,11 @@ All fields are loaded from environment variables by from_env() so no
 secrets are hardcoded or logged anywhere.
 
 Environment variables:
-  ANTHROPIC_API_KEY       → llm_api_key      (required)
+  LLM_GATEWAY_API_KEY     → llm_api_key      (required)
   GUARDRAIL_TOKEN         → guardrail_token  (required)
-  GUARDRAIL_MODEL         → llm_model        (default: claude-3-5-haiku-20241022)
+  GUARDRAIL_MODEL         → llm_model        (default: Bedrock-ant-haiku-4-5-20251001-v1-0)
+  GUARDRAIL_LLM_BASE_URL  → llm_base_url     (default: https://apiproxy.cdsys.local)
+  GUARDRAIL_LLM_CERT_PATH → llm_cert_path    (default: None)
   GUARDRAIL_POLICY_PATH   → policy_path      (default: policy.yaml)
   GUARDRAIL_CACHE_TTL     → cache_ttl        (default: 300)
   GUARDRAIL_LOG_LEVEL     → log_level        (default: INFO)
@@ -40,7 +44,7 @@ class GuardrailConfig(BaseModel):
     # ------------------------------------------------------------------
     llm_api_key: SecretStr = Field(
         ...,
-        description="Anthropic API key.  Never logged.",
+        description="LLM gateway API key.  Never logged.",
     )
     guardrail_token: SecretStr = Field(
         ...,
@@ -54,8 +58,19 @@ class GuardrailConfig(BaseModel):
     # Optional — LLM
     # ------------------------------------------------------------------
     llm_model: str = Field(
-        default="claude-3-5-haiku-20241022",
-        description="Anthropic model identifier to use for wrapped calls.",
+        default="Bedrock-ant-haiku-4-5-20251001-v1-0",
+        description="LLM gateway model identifier to use for wrapped calls.",
+    )
+    llm_base_url: str = Field(
+        default="https://apiproxy.cdsys.local/v1",
+        description="Base URL of the OpenAI-compatible LLM gateway.",
+    )
+    llm_cert_path: Path | None = Field(
+        default=None,
+        description=(
+            "Path to a CA cert file for verifying the gateway's TLS "
+            "certificate (required when on the Crest network/VPN)."
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -125,16 +140,16 @@ class GuardrailConfig(BaseModel):
         Load config from environment variables.
 
         Required env vars:
-          ANTHROPIC_API_KEY, GUARDRAIL_TOKEN
+          LLM_GATEWAY_API_KEY, GUARDRAIL_TOKEN
 
         Raises:
           ValueError if any mandatory variable is missing.
         """
         missing: list[str] = []
 
-        llm_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        llm_api_key = os.environ.get("LLM_GATEWAY_API_KEY", "")
         if not llm_api_key:
-            missing.append("ANTHROPIC_API_KEY")
+            missing.append("LLM_GATEWAY_API_KEY")
 
         guardrail_token = os.environ.get("GUARDRAIL_TOKEN", "")
         if not guardrail_token:
@@ -146,12 +161,18 @@ class GuardrailConfig(BaseModel):
                 "Set them in your .env file or export them before running."
             )
 
+        cert_path_str = os.environ.get("GUARDRAIL_LLM_CERT_PATH", "")
+
         return cls(
             llm_api_key=SecretStr(llm_api_key),
             guardrail_token=SecretStr(guardrail_token),
             llm_model=os.environ.get(
-                "GUARDRAIL_MODEL", "claude-3-5-haiku-20241022"
+                "GUARDRAIL_MODEL", "Bedrock-ant-haiku-4-5-20251001-v1-0"
             ),
+            llm_base_url=os.environ.get(
+                "GUARDRAIL_LLM_BASE_URL", "https://apiproxy.cdsys.local"
+            ),
+            llm_cert_path=Path(cert_path_str) if cert_path_str else None,
             policy_path=Path(
                 os.environ.get("GUARDRAIL_POLICY_PATH", "policy.yaml")
             ),

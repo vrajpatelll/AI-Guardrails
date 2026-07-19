@@ -63,6 +63,11 @@ class PolicyConfig(BaseModel):
     categories: dict[str, CategoryPolicy] = Field(default_factory=dict)
     latency_budget_ms: int = 150
     on_timeout: OnTimeout = OnTimeout.FAIL_OPEN
+    # Ceiling for waiting on Tier 2 (semantic model) once Tier 1 hasn't
+    # already forced BLOCK. Unlike on_timeout above, exceeding this always
+    # fails CLOSED (BLOCK) — unscanned text for harmful_content/
+    # prompt_injection must never reach the LLM.
+    tier2_timeout_ms: int = 30000
     # Populated by the loader after parsing — never comes from the YAML file
     policy_version: int = 0
 
